@@ -13,6 +13,9 @@
 #include "config.h"
 #include "messages.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 char *streaming_json = NULL;
 
 #define URI "api/v1/streaming/user"
@@ -59,6 +62,10 @@ struct nanotodon_config config;
 int term_w, term_h;
 int pad_x = 0, pad_y = 0;
 int monoflag = 0;
+int sixelflag = 0;
+
+// Sixel画像幅
+#define SIXEL_IMG_WIDTH (256)
 
 // Unicode文字列の幅を返す(半角文字=1)
 int ustrwidth(const char *str)
@@ -261,6 +268,68 @@ void stream_event_notify(struct json_object *jobj_from_string)
 	wrefresh(pad);
 }
 
+int rcv_written = 0;
+
+// curlから呼び出される汎用受信関数
+size_t rcv_callback(void* ptr, size_t size, size_t nmemb, void* data) {
+	if (size * nmemb == 0)
+		return 0;
+	
+	unsigned char **rcv = ((unsigned char **)data);
+	
+	size_t realsize = size * nmemb;
+	
+	size_t length = realsize;
+	unsigned char *dat = *rcv;
+	dat = realloc(dat, rcv_written + length);
+	
+	*rcv = dat;
+	
+	if (dat != NULL) {
+		memcpy(dat + rcv_written, ptr, realsize);
+		rcv_written += realsize;
+	}
+
+	return realsize;
+}
+
+// 汎用受信関数
+int rcv_data(char *url, unsigned char **ptr, unsigned int *len)
+{
+	CURLcode ret;
+	CURL *hnd;
+	
+	unsigned char *rcv = NULL;
+	rcv_written = 0;
+
+	hnd = curl_easy_init();
+	curl_easy_setopt(hnd, CURLOPT_URL, url);
+	curl_easy_setopt(hnd, CURLOPT_NOPROGRESS, 1L);
+	curl_easy_setopt(hnd, CURLOPT_USERAGENT, "curl/7.52.1");
+	curl_easy_setopt(hnd, CURLOPT_MAXREDIRS, 50L);
+	curl_easy_setopt(hnd, CURLOPT_TCP_KEEPALIVE, 1L);
+	curl_easy_setopt(hnd, CURLOPT_WRITEDATA, (void *)&rcv);
+	curl_easy_setopt(hnd, CURLOPT_WRITEFUNCTION, rcv_callback);
+
+	ret = curl_easy_perform(hnd);
+
+	curl_easy_cleanup(hnd);
+	hnd = NULL;
+	
+	*ptr = rcv;
+	*len = rcv_written;
+
+	return (int)ret;
+}
+
+const int bayerpattern[16] = {
+	  0,  8,  2, 10,
+	 12,  4, 14,  6,
+	  3, 11,  1,  9,
+	 15,  7, 13,  5
+};
+
+
 // ストリーミングでのToot受信処理,stream_event_handlerへ代入
 #define DATEBUFLEN	40
 void stream_event_update(struct json_object *jobj_from_string)
@@ -401,9 +470,51 @@ void stream_event_update(struct json_object *jobj_from_string)
 			struct json_object *url;
 			read_json_fom_path(obj, "url", &url);
 			if(json_object_is_type(url, json_type_string)) {
+				char *img_url = json_object_get_string(url);
+				
 				waddstr(scr, "🔗");
-				waddstr(scr, json_object_get_string(url));
+				waddstr(scr, img_url);
 				waddstr(scr, "\n");
+				
+				if(sixelflag) {
+					unsigned char *rcv = NULL;
+					unsigned int rcv_len;
+					rcv_data(img_url,&rcv,&rcv_len);
+					
+					int w,h,bpp;
+					stbi_uc *org = stbi_load_from_memory(rcv,rcv_len,&w,&h,&bpp,4);
+					
+					int w1 = SIXEL_IMG_WIDTH;
+					int h1 = (256*SIXEL_IMG_WIDTH) / (w*256/h);
+					
+					waddstr(scr, "\x1bPq");
+					
+					for(int y = 0; y < h1; y++) {
+						for(int x = 0; x < w1; x++) {
+							int nx = w * x / w1;
+							int ny = h * y / h1;
+							
+							int ths = bayerpattern[(y%4)*4+(x%4)]*16;
+							
+							int np = ny*w+nx;
+							
+							int r = org[np*4+2] >= ths ? 1 : 0;
+							int g = org[np*4+1] >= ths ? 1 : 0;
+							int b = org[np*4+0] >= ths ? 1 : 0;
+							
+							int c = b | (g << 1) | (r << 2);
+							
+							wprintw(scr, "#%d", c);
+							wprintw(scr, "%c", 0x3f + (1 << (y % 6)));
+						}
+						if((y % 6) == 5) waddstr(scr, "-");
+						else waddstr(scr, "$");
+					}
+					
+					waddstr(scr, "\x1b\\");
+					
+					stbi_image_free(org);
+				}
 			}
 		}
 	}
@@ -865,7 +976,10 @@ int main(int argc, char *argv[])
 		if(!strcmp(argv[i],"-mono")) {
 			monoflag = 1;
 			printf("Monochrome mode.\n");
-		} else {
+		} else if(!strcmp(argv[i],"-sixel")) {
+			sixelflag = 1;
+			printf("Sixel Enabled.\n");
+ 		}  else {
 			fprintf(stderr,"Unknown Option %s\n", argv[i]);
 		}
 	}
@@ -874,6 +988,20 @@ int main(int argc, char *argv[])
 	int msg_lang = 0;
 	
 	if(env_lang && !strcmp(env_lang,"ja_JP.UTF-8")) msg_lang = 1;
+	
+	if(sixelflag) {
+		printf("\x1bP7;;;7;q\x1b\\");
+		printf("\x1bPq");
+		
+		for(int i=0;i<8;i++) {
+			int r = ((i >> 2) & 1) * 100;
+			int g = ((i >> 1) & 1) * 100;
+			int b = ((i >> 0) & 1) * 100;
+			printf("#%d;2;%d;%d;%d",i,r,g,b);
+		}
+		
+		printf("\x1b\\");
+	}
 	
 	// トークンファイルオープン
 	FILE *fp = fopen(config.dot_token, "rb");
